@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    env_file:
+      - ./.env.compose
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./apps/backend
+    restart: unless-stopped
+    env_file:
+      - ./apps/backend/.env
+    ports:
+      - "8787:8787"
+    depends_on:
+      - postgres
+
+  web:
+    build:
+      context: ./apps/web
+    restart: unless-stopped
+    env_file:
+      - ./apps/web/.env.local
+      - ./.env.compose
+    environment:
+      BACKEND_API_URL: http://backend:8787
+      IMAGE_STORE_DIR: /app/.data/images
+      POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+      - postgres
+    volumes:
+      - web-image-data:/app/.data/images
+
+volumes:
+  postgres-data:
+  web-image-data:
