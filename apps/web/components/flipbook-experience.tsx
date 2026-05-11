@@ -3,50 +3,17 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { useRouter } from "next/navigation";
 
-import type { GeneratePageResult, StoredNode } from "@/lib/types";
+import type { GenerationJobInput, GenerationJobStatusEvent, StoredNode } from "@/lib/types";
 
 type Props = {
   initialNode?: StoredNode | null;
   initialSessionNodes?: StoredNode[];
 };
 
-type PersistPayload = {
-  sessionId: string;
-  parentId: string | null;
-  query: string;
-  pageTitle: string;
-  facts: string[];
-  prompt: string;
-  finalPrompt: string;
-  imageDataUrl: string;
-  imageModel: string;
-  imageMimeType: string;
-  aspectRatio: StoredNode["aspectRatio"];
-  styleAnchor: string | null;
-  subject: string | null;
-  clickInParent: StoredNode["clickInParent"];
-};
-
-type StreamStatusEvent = {
-  stage: "understanding-click" | "planning" | "generating-image" | "complete";
-  message?: string;
-};
-
-type StreamErrorEvent = {
-  detail?: string;
-};
-
 type NavigationContext = {
   parent: StoredNode | null;
   siblings: StoredNode[];
   children: StoredNode[];
-};
-
-type PreviewPage = {
-  query: string;
-  pageTitle: string;
-  facts: string[];
-  imageSrc: string;
 };
 
 const EMPTY_SESSION_NODES: StoredNode[] = [];
@@ -112,16 +79,20 @@ function buildNavigationContext(node: StoredNode | null, allNodes: StoredNode[])
   return { parent, siblings, children };
 }
 
-function mapStageToText(event: StreamStatusEvent): string {
+function mapStageToText(event: GenerationJobStatusEvent): string {
   switch (event.stage) {
+    case "queued":
+      return event.message ?? "任务已提交，正在准备生成…";
     case "understanding-click":
       return event.message ?? "正在理解点击区域…";
     case "planning":
       return event.message ?? "正在规划页面结构…";
     case "generating-image":
       return event.message ?? "正在生成图片…";
+    case "saving-node":
+      return event.message ?? "正在保存节点与图片…";
     case "complete":
-      return event.message ?? "图片已生成，正在保存页面…";
+      return event.message ?? "页面已保存。";
     default:
       return "正在处理…";
   }
@@ -158,64 +129,66 @@ async function createAnnotatedImage(
   return canvas.toDataURL("image/png");
 }
 
-async function parseSseResponse(
-  response: Response,
-  onStatus: (event: StreamStatusEvent) => void,
-): Promise<GeneratePageResult> {
-  if (!response.body) {
-    throw new Error("生成流没有返回内容");
-  }
+async function waitForJobResult(
+  jobId: string,
+  onStatus: (event: GenerationJobStatusEvent) => void,
+): Promise<StoredNode> {
+  const eventSource = new EventSource(`/api/jobs/${jobId}/events`);
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let result: GeneratePageResult | null = null;
+  return await new Promise<StoredNode>((resolve, reject) => {
+    let settled = false;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const cleanup = () => {
+      eventSource.close();
+    };
 
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
+    eventSource.addEventListener("status", (event) => {
+      onStatus(JSON.parse((event as MessageEvent).data) as GenerationJobStatusEvent);
+    });
 
-    for (const rawEvent of events) {
-      const lines = rawEvent.split("\n").filter(Boolean);
-      let eventName = "message";
-      const dataLines: string[] = [];
+    eventSource.addEventListener("result", (event) => {
+      settled = true;
+      cleanup();
+      resolve(JSON.parse((event as MessageEvent).data) as StoredNode);
+    });
 
-      for (const line of lines) {
-        if (line.startsWith("event:")) {
-          eventName = line.slice(6).trim();
-        } else if (line.startsWith("data:")) {
-          dataLines.push(line.slice(5).trim());
+    eventSource.addEventListener("failure", (event) => {
+      settled = true;
+      cleanup();
+      const payload = JSON.parse((event as MessageEvent).data) as { detail?: string };
+      reject(new Error(payload.detail || "生成失败"));
+    });
+
+    eventSource.onerror = async () => {
+      if (settled) {
+        return;
+      }
+      cleanup();
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error("任务状态读取失败");
         }
+        const payload = (await response.json()) as {
+          state: "queued" | "running" | "completed" | "failed";
+          status: GenerationJobStatusEvent;
+          node: StoredNode | null;
+          error: string | null;
+        };
+        onStatus(payload.status);
+        if (payload.state === "completed" && payload.node) {
+          settled = true;
+          resolve(payload.node);
+          return;
+        }
+        settled = true;
+        reject(new Error(payload.error || "任务连接中断"));
+      } catch (error) {
+        settled = true;
+        reject(error instanceof Error ? error : new Error("任务连接中断"));
       }
-
-      const data = dataLines.join("\n");
-      if (!data || data === "[DONE]") {
-        continue;
-      }
-
-      if (eventName === "status") {
-        onStatus(JSON.parse(data) as StreamStatusEvent);
-      } else if (eventName === "error") {
-        const payload = JSON.parse(data) as StreamErrorEvent;
-        throw new Error(payload.detail || "生成失败");
-      } else if (eventName === "result") {
-        result = JSON.parse(data) as GeneratePageResult;
-      }
-    }
-
-    if (done) {
-      break;
-    }
-  }
-
-  if (!result) {
-    throw new Error("生成结果缺失");
-  }
-
-  return result;
+    };
+  });
 }
 
 function NodePreviewCard({
@@ -260,7 +233,6 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
   const [videoTier, setVideoTier] = useState<"fast" | "balanced" | "pro">("fast");
   const [tapMarker, setTapMarker] = useState<{ x: number; y: number } | null>(null);
   const [imageExpired, setImageExpired] = useState(false);
-  const [previewPage, setPreviewPage] = useState<PreviewPage | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
 
   useEffect(() => {
@@ -274,24 +246,9 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
   }, [safeInitialSessionNodes]);
 
   useEffect(() => {
-    if (currentNode?.sessionId) {
-      void fetch(`/api/sessions/${currentNode.sessionId}`)
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error("会话读取失败");
-          }
-          return (await response.json()) as { nodes: StoredNode[] };
-        })
-        .then((payload) => setSessionNodes(payload.nodes))
-        .catch(() => undefined);
-    }
-  }, [currentNode?.sessionId]);
-
-  useEffect(() => {
     if (currentNode) {
       setQuery(currentNode.query);
       setImageExpired(false);
-      setPreviewPage(null);
     }
   }, [currentNode?.id, currentNode?.query]);
 
@@ -300,24 +257,13 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
     () => buildNavigationContext(currentNode, sessionNodes),
     [currentNode, sessionNodes],
   );
-  const displayedQuery = previewPage?.query ?? currentNode?.query ?? "";
-  const displayedTitle = previewPage?.pageTitle ?? currentNode?.pageTitle ?? "";
-  const displayedFacts = previewPage?.facts ?? currentNode?.facts ?? [];
-  const displayedImageSrc = previewPage?.imageSrc ?? currentNode?.imageUrl ?? null;
+  const displayedQuery = currentNode?.query ?? "";
+  const displayedTitle = currentNode?.pageTitle ?? "";
+  const displayedFacts = currentNode?.facts ?? [];
+  const displayedImageSrc = currentNode?.imageUrl ?? null;
 
-  async function persistNode(payload: PersistPayload): Promise<StoredNode> {
-    const response = await fetch("/api/nodes", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(detail || "页面持久化失败");
-    }
-    const node = (await response.json()) as StoredNode;
+  function applyGeneratedNode(node: StoredNode): StoredNode {
     setCurrentNode(node);
-    setPreviewPage(null);
     setSessionNodes((previous) => {
       const byId = new Map(previous.map((item) => [item.id, item]));
       byId.set(node.id, node);
@@ -329,25 +275,20 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
     return node;
   }
 
-  async function requestGeneration(body: Record<string, unknown>): Promise<GeneratePageResult> {
-    const response = await fetch("/api/generate-page", {
+  async function requestGeneration(body: GenerationJobInput): Promise<StoredNode> {
+    const response = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     if (!response.ok) {
       const detail = await response.text();
-      throw new Error(detail || "页面生成失败");
+      throw new Error(detail || "任务创建失败");
     }
-
-    const contentType = response.headers.get("content-type") ?? "";
-    if (contentType.includes("text/event-stream")) {
-      return parseSseResponse(response, (event) => {
-        setStatusText(mapStageToText(event));
-      });
-    }
-
-    return (await response.json()) as GeneratePageResult;
+    const payload = (await response.json()) as { jobId: string };
+    return waitForJobResult(payload.jobId, (event) => {
+      setStatusText(mapStageToText(event));
+    });
   }
 
   function navigateToNode(nodeId: string) {
@@ -364,43 +305,20 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
 
     setErrorText("");
     setIsGenerating(true);
-    setStatusText("正在规划页面结构并生成图片…");
+    setStatusText("任务已创建，正在准备生成…");
     try {
       const sessionId = makeId();
-      const result = await requestGeneration({
+      const node = await requestGeneration({
         query: trimmed,
         sessionId,
         imageTier,
         aspectRatio: "16:9",
         language: "zh-CN",
       });
-      setPreviewPage({
-        query: result.query,
-        pageTitle: result.page_title,
-        facts: result.facts,
-        imageSrc: result.image_data_url,
-      });
       setImageExpired(false);
-      setStatusText("图片已生成，正在保存节点链接…");
-      await persistNode({
-        sessionId,
-        parentId: null,
-        query: result.query,
-        pageTitle: result.page_title,
-        facts: result.facts,
-        prompt: result.prompt,
-        finalPrompt: result.final_prompt,
-        imageDataUrl: result.image_data_url,
-        imageModel: result.image_model,
-        imageMimeType: result.image_mime_type,
-        aspectRatio: result.aspect_ratio,
-        styleAnchor: result.style_anchor,
-        subject: result.subject,
-        clickInParent: result.click_in_parent,
-      });
+      applyGeneratedNode(node);
       setStatusText("点击图片任意区域，继续探索下一页。");
     } catch (error) {
-      setPreviewPage(null);
       setErrorText(error instanceof Error ? error.message : "生成失败");
       setStatusText("这次生成没有成功，请重试。");
     } finally {
@@ -420,11 +338,11 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
     setTapMarker(click);
     setIsGenerating(true);
     setErrorText("");
-    setStatusText("正在理解点击区域并生成下一页…");
+    setStatusText("任务已创建，正在理解点击区域…");
 
     try {
       const annotatedImageDataUrl = await createAnnotatedImage(imageRef.current, click);
-      const result = await requestGeneration({
+      const node = await requestGeneration({
         query: currentNode.pageTitle,
         sessionId: currentNode.sessionId,
         parentId: currentNode.id,
@@ -438,33 +356,10 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
         aspectRatio: currentNode.aspectRatio,
         language: "zh-CN",
       });
-      setPreviewPage({
-        query: result.query,
-        pageTitle: result.page_title,
-        facts: result.facts,
-        imageSrc: result.image_data_url,
-      });
       setImageExpired(false);
-      setStatusText("图片已生成，正在保存节点链接…");
-      await persistNode({
-        sessionId: currentNode.sessionId,
-        parentId: currentNode.id,
-        query: result.query,
-        pageTitle: result.page_title,
-        facts: result.facts,
-        prompt: result.prompt,
-        finalPrompt: result.final_prompt,
-        imageDataUrl: result.image_data_url,
-        imageModel: result.image_model,
-        imageMimeType: result.image_mime_type,
-        aspectRatio: result.aspect_ratio,
-        styleAnchor: result.style_anchor,
-        subject: result.subject,
-        clickInParent: result.click_in_parent,
-      });
+      applyGeneratedNode(node);
       setStatusText("下一页已生成，继续点击图片探索。");
     } catch (error) {
-      setPreviewPage(null);
       setErrorText(error instanceof Error ? error.message : "点击探索失败");
       setStatusText("这次点击没有生成新页，请重试。");
     } finally {
@@ -586,10 +481,10 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
 
           <div className="browser-content">
             <div
-              className={`result-frame ${currentNode && !imageExpired && !previewPage ? "interactive" : "empty"} ${isGenerating ? "busy" : ""}`}
-              onClick={currentNode && !imageExpired && !previewPage ? handleImageClick : undefined}
+              className={`result-frame ${currentNode && !imageExpired ? "interactive" : "empty"} ${isGenerating ? "busy" : ""}`}
+              onClick={currentNode && !imageExpired ? handleImageClick : undefined}
             >
-              {currentNode || previewPage ? (
+              {currentNode ? (
                 <>
                   {!imageExpired ? (
                     <img
@@ -637,15 +532,6 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
                       }}
                     />
                   ) : null}
-                  {isGenerating ? (
-                    <div className="frame-overlay">
-                      <div className="loading-card">
-                        <span className="loading-spinner" />
-                        <strong>{statusText}</strong>
-                        <span>生成完成后会自动保存为可分享页面。</span>
-                      </div>
-                    </div>
-                  ) : null}
                 </>
               ) : (
                 <div className="empty-state">
@@ -653,6 +539,15 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
                   <p>输入主题后生成一张可阅读、可点击、可继续翻页的知识页面。</p>
                 </div>
               )}
+              {isGenerating ? (
+                <div className="frame-overlay">
+                  <div className="loading-card">
+                    <span className="loading-spinner" />
+                    <strong>{statusText}</strong>
+                    <span>生成完成后会自动保存为可分享页面。</span>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
@@ -791,7 +686,7 @@ export function FlipbookExperience({ initialNode, initialSessionNodes }: Props) 
             <p className="share-note">
               节点链接可长期访问；图片文件采用 TTL 清理，过期后仍可通过父节点继续恢复探索路径。
             </p>
-            {currentNode.videoUrl && !previewPage ? (
+            {currentNode.videoUrl ? (
               <section>
                 <h3>动画预览</h3>
                 <video className="video-player" controls src={currentNode.videoUrl} />

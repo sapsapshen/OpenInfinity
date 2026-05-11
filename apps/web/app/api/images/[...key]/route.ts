@@ -8,7 +8,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ key: strin
   if (!stored) {
     return new Response("Not found", { status: 404 });
   }
-  return new Response(stored.buffer, {
+  return new Response(new Uint8Array(stored.buffer), {
     headers: {
       "Content-Type": stored.mimeType,
       "Cache-Control": "public, max-age=3600, must-revalidate",
@@ -16,4 +16,3 @@ export async function GET(_: Request, { params }: { params: Promise<{ key: strin
     },
   });
 }
-

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { cache } from "react";
 import { notFound } from "next/navigation";
 
 import { FlipbookExperience } from "@/components/flipbook-experience";
@@ -7,13 +8,16 @@ import { env } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
+const getCachedNode = cache(async (id: string) => getNodeById(id));
+const getCachedSessionNodes = cache(async (sessionId: string) => getSessionNodes(sessionId));
+
 export async function generateMetadata({
   params,
 }: {
   params: Promise<{ id: string }>;
 }): Promise<Metadata> {
   const { id } = await params;
-  const node = await getNodeById(id);
+  const node = await getCachedNode(id);
   if (!node) {
     return {
       title: "Page not found | OpenInfinity",
@@ -44,10 +48,10 @@ export async function generateMetadata({
 
 export default async function NodePage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const node = await getNodeById(id);
+  const node = await getCachedNode(id);
   if (!node) {
     notFound();
   }
-  const sessionNodes = await getSessionNodes(node.sessionId);
+  const sessionNodes = await getCachedSessionNodes(node.sessionId);
   return <FlipbookExperience initialNode={node} initialSessionNodes={sessionNodes} />;
 }

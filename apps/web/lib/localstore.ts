@@ -7,6 +7,11 @@ const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 let lastSweepStartedAt = 0;
 let sweepPromise: Promise<void> | null = null;
 
+declare global {
+  // eslint-disable-next-line no-var
+  var __openInfinityImageJanitorStarted__: boolean | undefined;
+}
+
 function assertSafeKey(key: string): string {
   if (!key || key.includes("..") || key.startsWith("/")) {
     throw new Error("Invalid image key");
@@ -91,17 +96,32 @@ async function sweepExpiredFiles(rootDir: string): Promise<void> {
   }
 }
 
+export function startImageStoreJanitor(): void {
+  if (global.__openInfinityImageJanitorStarted__) {
+    return;
+  }
+  global.__openInfinityImageJanitorStarted__ = true;
+
+  const runSweep = () => {
+    void sweepExpiredFiles(env.imageStoreDir).catch(() => undefined);
+  };
+
+  runSweep();
+  const timer = setInterval(runSweep, SWEEP_INTERVAL_MS);
+  timer.unref?.();
+}
+
 export async function saveImageFromDataUrl(
   keyBase: string,
   dataUrl: string,
 ): Promise<{ key: string; mimeType: string }> {
+  startImageStoreJanitor();
   assertSafeKey(keyBase);
   const { mimeType, buffer } = parseDataUrl(dataUrl);
   const key = assertSafeKey(`${keyBase}${extensionForMimeType(mimeType)}`);
   const targetPath = resolvePathWithinStore(key);
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   await fs.writeFile(targetPath, buffer);
-  await sweepExpiredFiles(env.imageStoreDir);
   return { key, mimeType };
 }
 
