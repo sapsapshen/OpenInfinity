@@ -18,7 +18,28 @@ class Settings(BaseSettings):
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         alias="VLM_BASE_URL",
     )
-    vlm_model: str = Field(default="qwen-vl-max-latest", alias="VLM_MODEL")
+    vlm_model: str = Field(default="qwen-vl-plus", alias="VLM_MODEL")
+
+    # Image provider: "dashscope" (async-poll wanx) or "siliconflow" (sync Flux)
+    image_provider: str = Field(default="dashscope", alias="IMAGE_PROVIDER")
+
+    siliconflow_api_key: str = Field(default="", alias="SILICONFLOW_API_KEY")
+    siliconflow_base_url: str = Field(
+        default="https://api.siliconflow.cn/v1",
+        alias="SILICONFLOW_BASE_URL",
+    )
+    siliconflow_image_model_fast: str = Field(
+        default="black-forest-labs/FLUX.1-schnell",
+        alias="SILICONFLOW_IMAGE_MODEL_FAST",
+    )
+    siliconflow_image_model_balanced: str = Field(
+        default="black-forest-labs/FLUX.1-dev",
+        alias="SILICONFLOW_IMAGE_MODEL_BALANCED",
+    )
+    siliconflow_image_model_pro: str = Field(
+        default="black-forest-labs/FLUX.1-pro",
+        alias="SILICONFLOW_IMAGE_MODEL_PRO",
+    )
 
     dashscope_base_url: str = Field(
         default="https://dashscope.aliyuncs.com/api/v1",
@@ -59,8 +80,15 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
-    def image_model_for_tier(self, tier: str | None) -> str:
+    def image_model_for_tier(self, tier: str | None, provider: str | None = None) -> str:
         resolved = (tier or self.image_tier).lower()
+        effective_provider = (provider or self.image_provider).lower()
+        if effective_provider == "siliconflow":
+            if resolved == "fast":
+                return self.siliconflow_image_model_fast
+            if resolved == "pro":
+                return self.siliconflow_image_model_pro
+            return self.siliconflow_image_model_balanced
         if resolved == "fast":
             return self.dashscope_image_model_fast
         if resolved == "pro":

@@ -36,7 +36,10 @@ export type BackendGenerateResult = {
   aspect_ratio: StoredNode["aspectRatio"];
   image_model: string;
   image_mime_type: string;
-  image_data_url: string;
+  /** Set when backend returns a CDN URL (preferred). */
+  image_url: string | null;
+  /** Set when backend returns bytes encoded as data URL (fallback). */
+  image_data_url: string | null;
   subject: string | null;
   style_anchor: string | null;
   click_in_parent: ClickPoint | null;

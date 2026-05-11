@@ -30,6 +30,16 @@ def _data_url_from_bytes(image_bytes: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def _image_fields_from_result(image_result) -> dict:
+    """Return the image payload fields, preferring URL over data-URL."""
+    if image_result.image_url:
+        return {"image_url": image_result.image_url, "image_data_url": None}
+    return {
+        "image_url": None,
+        "image_data_url": _data_url_from_bytes(image_result.image_bytes, image_result.mime_type),
+    }
+
+
 def _sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -83,7 +93,7 @@ async def _generate_payload(request: GenerateRequest) -> GenerateResponse:
         aspect_ratio=request.aspect_ratio,
         image_model=image_result.model,
         image_mime_type=image_result.mime_type,
-        image_data_url=_data_url_from_bytes(image_result.image_bytes, image_result.mime_type),
+        **_image_fields_from_result(image_result),
         subject=subject,
         style_anchor=style_anchor,
         click_in_parent=request.click,
@@ -151,7 +161,7 @@ async def sse_generate(request: GenerateRequest) -> StreamingResponse:
                 aspect_ratio=request.aspect_ratio,
                 image_model=image_result.model,
                 image_mime_type=image_result.mime_type,
-                image_data_url=_data_url_from_bytes(image_result.image_bytes, image_result.mime_type),
+                **_image_fields_from_result(image_result),
                 subject=subject,
                 style_anchor=style_anchor,
                 click_in_parent=request.click,

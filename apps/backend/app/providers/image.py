@@ -1,13 +1,15 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from json import JSONDecodeError
+from typing import Literal
 
 import httpx
 from fastapi import HTTPException
 
 from app.config import get_settings
 
-SIZE_MAP = {
+# DashScope uses "*" separator; SiliconFlow uses "x"
+_DASHSCOPE_SIZE_MAP = {
     "1:1": "1024*1024",
     "4:3": "1024*768",
     "3:4": "768*1024",
@@ -15,13 +17,23 @@ SIZE_MAP = {
     "9:16": "720*1280",
 }
 
+_SILICONFLOW_SIZE_MAP = {
+    "1:1": "1024x1024",
+    "4:3": "1024x768",
+    "3:4": "768x1024",
+    "16:9": "1280x720",
+    "9:16": "720x1280",
+}
+
 
 @dataclass(slots=True)
 class GeneratedImage:
-    image_bytes: bytes
+    # Exactly one of image_bytes or image_url will be set
+    image_bytes: bytes | None
+    image_url: str | None
     mime_type: str
     model: str
-    revised_prompt: str | None = None
+    revised_prompt: str | None = field(default=None)
 
 
 def _parse_json_response(response: httpx.Response, label: str) -> dict:
@@ -35,7 +47,7 @@ def _parse_json_response(response: httpx.Response, label: str) -> dict:
         ) from exc
 
 
-def _raise_for_dashscope_response(response: httpx.Response, label: str) -> None:
+def _raise_for_status(response: httpx.Response, label: str) -> None:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -58,42 +70,43 @@ def _raise_for_dashscope_response(response: httpx.Response, label: str) -> None:
         raise HTTPException(status_code=response.status_code, detail=detail) from exc
 
 
-async def generate_image(prompt: str, aspect_ratio: str, tier: str) -> GeneratedImage:
+async def _dashscope_generate(
+    prompt: str, aspect_ratio: str, tier: str
+) -> GeneratedImage:
     settings = get_settings()
-    model = settings.image_model_for_tier(tier)
-    size = SIZE_MAP.get(aspect_ratio, SIZE_MAP["16:9"])
-    headers = {
-        "Authorization": f"Bearer {settings.dashscope_api_key}",
-        "Content-Type": "application/json",
-        "X-DashScope-Async": "enable",
-    }
+    model = settings.image_model_for_tier(tier, "dashscope")
+    size = _DASHSCOPE_SIZE_MAP.get(aspect_ratio, _DASHSCOPE_SIZE_MAP["16:9"])
+    auth = f"Bearer {settings.dashscope_api_key}"
     create_url = f"{settings.dashscope_base_url}/services/aigc/text2image/image-synthesis"
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         create_response = await client.post(
             create_url,
-            headers=headers,
+            headers={
+                "Authorization": auth,
+                "Content-Type": "application/json",
+                "X-DashScope-Async": "enable",
+            },
             json={
                 "model": model,
                 "input": {"prompt": prompt},
                 "parameters": {"size": size, "n": 1},
             },
         )
-        _raise_for_dashscope_response(create_response, "DashScope image create")
+        _raise_for_status(create_response, "DashScope image create")
         create_payload = _parse_json_response(create_response, "DashScope image create")
         task_id = create_payload.get("output", {}).get("task_id")
         if not task_id:
             raise HTTPException(status_code=502, detail="DashScope image task_id missing")
 
         task_url = f"{settings.dashscope_base_url}/tasks/{task_id}"
+        task_headers = {"Authorization": auth}
         image_url: str | None = None
         revised_prompt: str | None = None
+
         for _ in range(80):
-            task_response = await client.get(
-                task_url,
-                headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
-            )
-            _raise_for_dashscope_response(task_response, "DashScope image task poll")
+            task_response = await client.get(task_url, headers=task_headers)
+            _raise_for_status(task_response, "DashScope image task poll")
             task_payload = _parse_json_response(task_response, "DashScope image task poll")
             output = task_payload.get("output", {})
             task_status = output.get("task_status")
@@ -114,12 +127,67 @@ async def generate_image(prompt: str, aspect_ratio: str, tier: str) -> Generated
         if not image_url:
             raise HTTPException(status_code=504, detail="DashScope image generation timed out")
 
-        image_response = await client.get(image_url)
-        _raise_for_dashscope_response(image_response, "DashScope image download")
-        mime_type = image_response.headers.get("content-type", "image/png").split(";")[0]
+        # Return the CDN URL directly — the web layer will download + cache it
         return GeneratedImage(
-            image_bytes=image_response.content,
-            mime_type=mime_type,
+            image_bytes=None,
+            image_url=image_url,
+            mime_type="image/jpeg",
             model=model,
             revised_prompt=revised_prompt,
         )
+
+
+async def _siliconflow_generate(
+    prompt: str, aspect_ratio: str, tier: str
+) -> GeneratedImage:
+    """Synchronous image generation via SiliconFlow (Flux). Typical latency: 3–8 s."""
+    settings = get_settings()
+    model = settings.image_model_for_tier(tier, "siliconflow")
+    image_size = _SILICONFLOW_SIZE_MAP.get(aspect_ratio, _SILICONFLOW_SIZE_MAP["16:9"])
+
+    # Turbo-style step count only for schnell; dev/pro use their own defaults
+    extra: dict = {}
+    if "schnell" in model.lower():
+        extra["num_inference_steps"] = 4
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            f"{settings.siliconflow_base_url}/images/generations",
+            headers={
+                "Authorization": f"Bearer {settings.siliconflow_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "prompt": prompt,
+                "image_size": image_size,
+                "batch_size": 1,
+                **extra,
+            },
+        )
+        _raise_for_status(response, "SiliconFlow image")
+        payload = _parse_json_response(response, "SiliconFlow image")
+        images = payload.get("images") or []
+        if not images or not images[0].get("url"):
+            raise HTTPException(status_code=502, detail="SiliconFlow image result missing")
+
+        image_url: str = images[0]["url"]
+        return GeneratedImage(
+            image_bytes=None,
+            image_url=image_url,
+            mime_type="image/jpeg",
+            model=model,
+        )
+
+
+async def generate_image(
+    prompt: str,
+    aspect_ratio: str,
+    tier: str,
+    provider: Literal["dashscope", "siliconflow"] | None = None,
+) -> GeneratedImage:
+    settings = get_settings()
+    effective_provider = (provider or settings.image_provider).lower()
+    if effective_provider == "siliconflow":
+        return await _siliconflow_generate(prompt, aspect_ratio, tier)
+    return await _dashscope_generate(prompt, aspect_ratio, tier)

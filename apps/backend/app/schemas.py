@@ -45,7 +45,9 @@ class GenerateResponse(BaseModel):
     aspect_ratio: str
     image_model: str
     image_mime_type: str
-    image_data_url: str
+    # Exactly one of these will be set — prefer image_url when available
+    image_data_url: str | None = None
+    image_url: str | None = None
     subject: str | None = None
     style_anchor: str | None = None
     click_in_parent: ClickPoint | None = None

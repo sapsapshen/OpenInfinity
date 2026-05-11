@@ -111,6 +111,26 @@ export function startImageStoreJanitor(): void {
   timer.unref?.();
 }
 
+export async function saveImageFromUrl(
+  keyBase: string,
+  url: string,
+): Promise<{ key: string; mimeType: string }> {
+  startImageStoreJanitor();
+  assertSafeKey(keyBase);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image from URL: ${response.status} ${response.statusText}`);
+  }
+  const mimeType = (response.headers.get("content-type") ?? "image/jpeg").split(";")[0].trim();
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const key = assertSafeKey(`${keyBase}${extensionForMimeType(mimeType)}`);
+  const targetPath = resolvePathWithinStore(key);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, buffer);
+  return { key, mimeType };
+}
+
 export async function saveImageFromDataUrl(
   keyBase: string,
   dataUrl: string,

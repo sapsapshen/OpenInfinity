@@ -3,13 +3,18 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 
 import { insertNode } from "@/lib/db";
-import { imageUrlFromKey, saveImageFromDataUrl } from "@/lib/localstore";
+import { imageUrlFromKey, saveImageFromDataUrl, saveImageFromUrl } from "@/lib/localstore";
 import type { BackendGenerateResult, StoredNode } from "@/lib/types";
 
 export async function persistGeneratedNode(payload: BackendGenerateResult): Promise<StoredNode> {
   const id = randomUUID();
   const sessionId = payload.session_id ?? randomUUID();
-  const saved = await saveImageFromDataUrl(`${sessionId}/${id}`, payload.image_data_url);
+  const keyBase = `${sessionId}/${id}`;
+
+  const saved =
+    payload.image_url
+      ? await saveImageFromUrl(keyBase, payload.image_url)
+      : await saveImageFromDataUrl(keyBase, payload.image_data_url!);
 
   const node: StoredNode = {
     id,
