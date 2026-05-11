@@ -163,10 +163,12 @@ stop_project_port_listeners() {
 
 wait_for_http() {
   local url="$1"
-  local retries="${2:-120}"
+  local retries="${2:-180}"
   for _ in $(seq 1 "$retries"); do
     local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    # --max-time 15: next dev first-request triggers Turbopack compilation (~10-60s);
+    # without a timeout curl hangs indefinitely keeping this loop stuck.
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null || true)"
     if [[ "$code" =~ ^[23] ]]; then
       return 0
     fi
